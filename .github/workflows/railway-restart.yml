@@ -1,0 +1,254 @@
+name: Railway Service Restart
+
+# ============================================================================
+# WORKFLOW DOCUMENTATION
+# ============================================================================
+# This workflow automatically restarts the bee-toxicity-predictor service on
+# Railway when failures are detected or when manually triggered.
+#
+# SETUP INSTRUCTIONS:
+# -------------------
+# 1. Create Railway API Token:
+#    - Go to https://railway.app/account/tokens
+#    - Click "Create Token"
+#    - Give it a descriptive name (e.g., "GitHub Actions Restart Token")
+#    - Copy the generated token
+#
+# 2. Add GitHub Secret:
+#    - Go to your repository Settings > Secrets and variables > Actions
+#    - Click "New repository secret"
+#    - Name: RAILWAY_API_TOKEN
+#    - Value: [paste your Railway API token]
+#    - Click "Add secret"
+#
+# 3. Get Railway Service and Project IDs:
+#    - Go to your Railway project dashboard
+#    - Click on your service (bee-toxicity-predictor)
+#    - Copy the Service ID from the URL or settings
+#    - Add as secrets: RAILWAY_SERVICE_ID and RAILWAY_PROJECT_ID
+#
+# 4. Configure Railway Webhook (for automatic triggers):
+#    - In Railway project settings, go to Webhooks
+#    - Create a new webhook with URL:
+#      https://api.github.com/repos/TyLuHow/overflowing-perfection/dispatches
+#    - Set the webhook to trigger on deployment failures
+#    - Add Authorization header: token [YOUR_GITHUB_PAT]
+#    - Set webhook body to include: {"event_type": "railway-failure"}
+#
+# MANUAL TRIGGER:
+# ---------------
+# Go to Actions tab > Railway Service Restart > Run workflow
+#
+# ============================================================================
+
+on:
+  # Automatic trigger from Railway webhook
+  repository_dispatch:
+    types: [railway-failure]
+  
+  # Manual trigger option
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: 'Reason for manual restart'
+        required: false
+        default: 'Manual restart triggered'
+
+env:
+  SERVICE_NAME: bee-toxicity-predictor
+
+jobs:
+  restart-service:
+    name: Restart Railway Service
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    
+    steps:
+      - name: Validate Environment
+        id: validate
+        run: |
+          echo "🔍 Validating environment variables and secrets..."
+          
+          if [ -z "${{ secrets.RAILWAY_API_TOKEN }}" ]; then
+            echo "❌ ERROR: RAILWAY_API_TOKEN secret is not set"
+            echo "Please add your Railway API token to GitHub secrets"
+            exit 1
+          fi
+          
+          if [ -z "${{ secrets.RAILWAY_SERVICE_ID }}" ]; then
+            echo "❌ ERROR: RAILWAY_SERVICE_ID secret is not set"
+            echo "Please add your Railway service ID to GitHub secrets"
+            exit 1
+          fi
+          
+          echo "✅ All required secrets are present"
+          echo "trigger_type=${{ github.event_name }}" >> $GITHUB_OUTPUT
+
+      - name: Log Restart Context
+        run: |
+          echo "📋 Restart Context Information"
+          echo "================================"
+          echo "Service: ${{ env.SERVICE_NAME }}"
+          echo "Trigger: ${{ steps.validate.outputs.trigger_type }}"
+          echo "Timestamp: $(date -u +"%Y-%m-%d %H:%M:%S UTC")"
+          
+          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+            echo "Trigger Type: Automatic (Railway webhook)"
+            echo "Event Type: ${{ github.event.action }}"
+          else
+            echo "Trigger Type: Manual"
+            echo "Triggered by: ${{ github.actor }}"
+            echo "Reason: ${{ github.event.inputs.reason }}"
+          fi
+
+      - name: Get Service Status (Pre-Restart)
+        id: pre-status
+        continue-on-error: true
+        run: |
+          echo "📊 Checking current service status..."
+          
+          response=$(curl -s -w "\n%{http_code}" \
+            -H "Authorization: Bearer ${{ secrets.RAILWAY_API_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -X POST \
+            -d '{"query": "query service($id: String!) { service(id: $id) { id name latestDeployment { id status } } }", "variables": {"id": "${{ secrets.RAILWAY_SERVICE_ID }}"}}' \
+            https://backboard.railway.app/graphql)
+          
+          http_code=$(echo "$response" | tail -n1)
+          body=$(echo "$response" | sed '$d')
+          
+          echo "Response code: $http_code"
+          echo "$body" | jq '.' || echo "$body"
+          
+          if [ "$http_code" -eq 200 ]; then
+            echo "✅ Successfully retrieved service status"
+            echo "status_check=success" >> $GITHUB_OUTPUT
+          else
+            echo "⚠️ Warning: Could not retrieve service status (HTTP $http_code)"
+            echo "status_check=failed" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Restart Railway Service
+        id: restart
+        run: |
+          echo "🔄 Initiating service restart..."
+          
+          # Railway GraphQL mutation to restart deployment
+          response=$(curl -s -w "\n%{http_code}" \
+            -H "Authorization: Bearer ${{ secrets.RAILWAY_API_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -X POST \
+            -d '{
+              "query": "mutation serviceInstanceRedeploy($serviceId: String!) { serviceInstanceRedeploy(serviceId: $serviceId) }",
+              "variables": {
+                "serviceId": "${{ secrets.RAILWAY_SERVICE_ID }}"
+              }
+            }' \
+            https://backboard.railway.app/graphql)
+          
+          http_code=$(echo "$response" | tail -n1)
+          body=$(echo "$response" | sed '$d')
+          
+          echo "Response code: $http_code"
+          echo "Response body:"
+          echo "$body" | jq '.' || echo "$body"
+          
+          # Check for errors in response
+          if [ "$http_code" -eq 200 ]; then
+            if echo "$body" | jq -e '.errors' > /dev/null 2>&1; then
+              echo "❌ ERROR: Railway API returned errors"
+              echo "$body" | jq '.errors'
+              exit 1
+            fi
+            
+            echo "✅ Service restart initiated successfully"
+            echo "restart_status=success" >> $GITHUB_OUTPUT
+          else
+            echo "❌ ERROR: HTTP request failed with code $http_code"
+            exit 1
+          fi
+
+      - name: Wait for Deployment
+        id: wait
+        run: |
+          echo "⏳ Waiting for deployment to start..."
+          sleep 10
+          
+          echo "Deployment initiated. Monitor at: https://railway.app/project/${{ secrets.RAILWAY_PROJECT_ID }}"
+
+      - name: Verify Deployment Status
+        id: verify
+        continue-on-error: true
+        run: |
+          echo "🔍 Verifying deployment status..."
+          
+          response=$(curl -s -w "\n%{http_code}" \
+            -H "Authorization: Bearer ${{ secrets.RAILWAY_API_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -X POST \
+            -d '{"query": "query service($id: String!) { service(id: $id) { id name latestDeployment { id status createdAt } } }", "variables": {"id": "${{ secrets.RAILWAY_SERVICE_ID }}"}}' \
+            https://backboard.railway.app/graphql)
+          
+          http_code=$(echo "$response" | tail -n1)
+          body=$(echo "$response" | sed '$d')
+          
+          if [ "$http_code" -eq 200 ]; then
+            deployment_status=$(echo "$body" | jq -r '.data.service.latestDeployment.status // "unknown"')
+            echo "Current deployment status: $deployment_status"
+            
+            if [ "$deployment_status" = "SUCCESS" ] || [ "$deployment_status" = "BUILDING" ] || [ "$deployment_status" = "DEPLOYING" ]; then
+              echo "✅ Deployment is progressing normally"
+              exit 0
+            else
+              echo "⚠️ Warning: Deployment status is $deployment_status"
+              exit 0
+            fi
+          else
+            echo "⚠️ Could not verify deployment status"
+            exit 0
+          fi
+
+      - name: Report Success
+        if: steps.restart.outputs.restart_status == 'success'
+        run: |
+          echo "============================================"
+          echo "✅ RESTART COMPLETED SUCCESSFULLY"
+          echo "============================================"
+          echo "Service: ${{ env.SERVICE_NAME }}"
+          echo "Time: $(date -u +"%Y-%m-%d %H:%M:%S UTC")"
+          echo ""
+          echo "📊 Monitor deployment progress at:"
+          echo "https://railway.app/project/${{ secrets.RAILWAY_PROJECT_ID }}"
+          echo "============================================"
+
+      - name: Report Failure
+        if: failure()
+        run: |
+          echo "============================================"
+          echo "❌ RESTART FAILED"
+          echo "============================================"
+          echo "Service: ${{ env.SERVICE_NAME }}"
+          echo "Time: $(date -u +"%Y-%m-%d %H:%M:%S UTC")"
+          echo ""
+          echo "🔧 Troubleshooting Steps:"
+          echo "1. Verify RAILWAY_API_TOKEN is valid and not expired"
+          echo "2. Check RAILWAY_SERVICE_ID is correct"
+          echo "3. Ensure API token has sufficient permissions"
+          echo "4. Check Railway service status manually"
+          echo "5. Review Railway API documentation: https://docs.railway.app/reference/api"
+          echo ""
+          echo "🔗 Railway Dashboard:"
+          echo "https://railway.app/project/${{ secrets.RAILWAY_PROJECT_ID }}"
+          echo "============================================"
+          exit 1
+
+      - name: Send Notification (Optional)
+        if: always()
+        run: |
+          echo "💬 Notification step (configure with your preferred service)"
+          echo "Status: ${{ job.status }}"
+          # Add Slack, Discord, email, or other notification integrations here
+          # Example for Slack:
+          # curl -X POST -H 'Content-type: application/json' \
+          #   --data '{"text":"Railway restart ${{ job.status }}: ${{ env.SERVICE_NAME }}"}' \
+          #   ${{ secrets.SLACK_WEBHOOK_URL }}
